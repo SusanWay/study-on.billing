@@ -3,39 +3,54 @@
 namespace App\Controller;
 
 
-use App\Dto\UserDto;
+use App\DTO\UserDTO;
 use App\Entity\User;
 use App\Repository\UserRepository;
-use JMS\Serializer\Serializer;
-use JMS\Serializer\SerializerBuilder;
+use App\Service\PaymentService;
+use Doctrine\Persistence\ManagerRegistry;
+use Doctrine\Persistence\ObjectManager;
+use Gesdinet\JWTRefreshTokenBundle\Generator\RefreshTokenGeneratorInterface;
+use Gesdinet\JWTRefreshTokenBundle\Model\RefreshTokenManagerInterface;
 use Lexik\Bundle\JWTAuthenticationBundle\Services\JWTTokenManagerInterface;
-use Nelmio\ApiDocBundle\Annotation\Security;
 use Symfony\Bundle\FrameworkBundle\Controller\AbstractController;
 use Symfony\Component\HttpFoundation\JsonResponse;
 use Symfony\Component\HttpFoundation\Request;
 use Symfony\Component\HttpFoundation\Response;
 use Symfony\Component\PasswordHasher\Hasher\UserPasswordHasherInterface;
-use Symfony\Component\Routing\Annotation\Route;
+use JMS\Serializer\Serializer;
+use JMS\Serializer\SerializerBuilder;
 use Symfony\Component\Validator\Validator\ValidatorInterface;
+use Symfony\Component\Routing\Annotation\Route;
+use Nelmio\ApiDocBundle\Annotation\Model;
+use Nelmio\ApiDocBundle\Annotation\Security;
 use OpenApi\Annotations as OA;
+use PHP_CodeSniffer\Tokenizers\JS;
+use Symfony\Component\Security\Core\Authentication\Token\Storage\TokenStorageInterface;
 
 class UserApiController extends AbstractController
 {
 
-    private ValidatorInterface $validator;
-
     private Serializer $serializer;
-
-    private UserPasswordHasherInterface $hasher;
+    private ValidatorInterface $validator;
+    private UserPasswordHasherInterface $passwordHasher;
+    private ObjectManager $entityManager;
+    private TokenStorageInterface $tokenStorageInterface;
+    private JWTTokenManagerInterface $jwtManager;
 
     public function __construct(
+        ManagerRegistry             $doctrine,
         ValidatorInterface          $validator,
-        UserPasswordHasherInterface $hasher
+        UserPasswordHasherInterface $passwordHasher,
+        TokenStorageInterface       $tokenStorageInterface,
+        JWTTokenManagerInterface    $jwtManager
     )
     {
-        $this->validator = $validator;
+        $this->entityManager = $doctrine->getManager();
         $this->serializer = SerializerBuilder::create()->build();
-        $this->hasher = $hasher;
+        $this->validator = $validator;
+        $this->passwordHasher = $passwordHasher;
+        $this->tokenStorageInterface = $tokenStorageInterface;
+        $this->jwtManager = $jwtManager;
     }
 
     /**
@@ -96,7 +111,7 @@ class UserApiController extends AbstractController
 
     /**
      * @Route("/api/v1/register", name="api_register", methods={"POST"})
-    @OA\Post(
+     * @OA\Post(
      *     path="/api/v1/register",
      *     summary="Регистрация ползователя",
      *     description="Регистрация пользователя и получение JWT токена"
@@ -150,33 +165,140 @@ class UserApiController extends AbstractController
      *        )
      *     )
      * )
+     * @OA\Response(
+     *     response=500,
+     *     description="Неизвестная ошибка",
+     *     @OA\JsonContent(
+     *        @OA\Property(
+     *          property="code",
+     *          type="string"
+     *        ),
+     *        @OA\Property(
+     *          property="message",
+     *          type="string"
+     *        )
+     *     )
+     * )
      * @OA\Tag(name="User")
+     * @param Request $req
+     * @param UserRepository $repo
+     * @param JWTTokenManagerInterface $jwtManager
+     * @param $request
+     * @return JsonResponse
      */
-    public function register(Request $req, UserRepository $repo, JWTTokenManagerInterface $jwtManager): JsonResponse
+    public function register(
+        Request                        $request,
+        UserRepository                 $repo,
+        JWTTokenManagerInterface       $jwtManager,
+        RefreshTokenGeneratorInterface $refreshTokenGenerator,
+        RefreshTokenManagerInterface   $refreshTokenManager,
+        PaymentService                 $paymentService
+    ): JsonResponse
     {
-        $dto = $this->serializer->deserialize($req->getContent(), UserDTO::class, 'json');
-        $errs = $this->validator->validate($dto);
 
-        if (count($errs) > 0) {
-            $jsonErrors = [];
-            foreach ($errs as $error) {
-                $jsonErrors[$error->getPropertyPath()] = $error->getMessage();
+        $DTO_user = $this->serializer->deserialize($request->getContent(), UserDTO::class, 'json');
+        $errors = $this->validator->validate($DTO_user);
+        if (count($errors) > 0) {
+            $errors_array = [];
+            foreach ($errors as $error) {
+                $errors_array[] = $error->getMessage();
             }
-            return new JsonResponse(['error' => $jsonErrors], Response::HTTP_BAD_REQUEST);
+            return new JsonResponse(['errors' => $errors_array], Response::HTTP_BAD_REQUEST);
+        }
+        if ($this->entityManager->getRepository(User::class)->findOneByEmail($DTO_user->getUsername())) {
+            return new JsonResponse(['errors' => ['This email already exists']], Response::HTTP_BAD_REQUEST);
         }
 
-        if ($repo->findOneBy(['email' => $dto->username])) {
-            return new JsonResponse(['error' => 'Email уже используется.'], Response::HTTP_CONFLICT);
-        }
-        $user = User::formDTO($dto);
+        $user = User::getFromDTO($DTO_user);
+
         $user->setPassword(
-            $this->hasher->hashPassword($user, $user->getPassword())
+            $this->passwordHasher->hashPassword($user, $user->getPassword())
         );
-        $repo->add($user, true);
+
+        $this->entityManager->getRepository(User::class)->add($user, true);
+
+        // TODO Подтягивание начального депозита из конфигуарционного фала
+        $paymentService->deposit($user, 100);
+        $refreshToken = $refreshTokenGenerator->createForUserWithTtl(
+            $user,
+            (new \DateTime())->modify('+1 month')->getTimestamp()
+        );
+        $refreshTokenManager->save($refreshToken);
+
         return new JsonResponse([
-            'token' => $jwtManager->create($user),
+            'token' => $this->jwtManager->create($user),
+            'refresh_token' => $refreshToken->getRefreshToken(),
             'roles' => $user->getRoles(),
         ], Response::HTTP_CREATED);
+    }
+
+    /**
+     * @Route("/api/v1/token/refresh", name="api_refresh_token", methods={"POST"})
+     * @OA\Post(
+     *     path="/api/v1/token/refresh",
+     *     summary="Обновление истекших токенов",
+     *     description="Обновление истекших токенов"
+     * )
+     * @OA\RequestBody(
+     *     required=true,
+     *     @OA\JsonContent(
+     *        @OA\Property(
+     *          property="refresh_token",
+     *          type="string",
+     *          description="refresh токен пользователя",
+     *          example="refresh_token",
+     *        ),
+     *     )
+     *)
+     * @OA\Response(
+     *     response=200,
+     *     description="Обновление истекших токенов",
+     *     @OA\JsonContent(
+     *        @OA\Property(
+     *          property="token",
+     *          type="string",
+     *        ),
+     *        @OA\Property(
+     *          property="refresh_token",
+     *          type="string",
+     *        ),
+     *     )
+     * )
+     * @OA\Response(
+     *     response=401,
+     *     description="Ошибка аутентификации",
+     *     @OA\JsonContent(
+     *        @OA\Property(
+     *          property="code",
+     *          type="string",
+     *          example="401"
+     *        ),
+     *        @OA\Property(
+     *          property="message",
+     *          type="string",
+     *          example="Invalid credentials."
+     *        ),
+     *     )
+     * )
+     * @OA\Response(
+     *     response="default",
+     *     description="Неизвестная ошибка",
+     *     @OA\JsonContent(
+     *        @OA\Property(
+     *          property="code",
+     *          type="string"
+     *        ),
+     *        @OA\Property(
+     *          property="message",
+     *          type="string"
+     *        ),
+     *     )
+     * )
+     * @OA\Tag(name="User")
+     */
+    public function refresh(): void
+    {
+
     }
 
     /**

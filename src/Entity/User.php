@@ -44,6 +44,10 @@ class User implements UserInterface, PasswordAuthenticatedUserInterface
      */
     private $balance = 0.0;
 
+    /**
+     * @ORM\OneToMany(targetEntity=Transaction::class, mappedBy="customer")
+     */
+    private $transactions;
     public function getId(): ?int
     {
         return $this->id;
@@ -152,13 +156,50 @@ class User implements UserInterface, PasswordAuthenticatedUserInterface
             'common' => ['algorithm' => 'bcrypt']
         ]);
         $hasher = $factory->getPasswordHasher('common');
-        $user->setEmail($userDto->username);
+        $user->setEmail($userDto->getUsername());
         $user->setBalance(0);
-        $password = $hasher->hash($userDto->password);
+        $password = $hasher->hash($userDto->getPassword());
         $user->setPassword($password);
 
         $user->setRoles(['ROLE_USER']);
 
         return $user;
+    }
+
+    /**
+     * @return Collection<int, Transaction>
+     */
+    public function getTransactions(): Collection
+    {
+        return $this->transactions;
+    }
+
+    public function addTransaction(Transaction $transaction): self
+    {
+        if (!$this->transactions->contains($transaction)) {
+            $this->transactions[] = $transaction;
+            $transaction->setCustomer($this);
+        }
+
+        return $this;
+    }
+
+    public function removeTransaction(Transaction $transaction): self
+    {
+        if ($this->transactions->removeElement($transaction)) {
+            // set the owning side to null (unless already changed)
+            if ($transaction->getCustomer() === $this) {
+                $transaction->setCustomer(null);
+            }
+        }
+
+        return $this;
+    }
+
+    public static function getFromDTO(UserDTO $userDTO): User
+    {
+        return (new self())
+            ->setEmail($userDTO->getUsername())
+            ->setPassword($userDTO->getPassword());
     }
 }
